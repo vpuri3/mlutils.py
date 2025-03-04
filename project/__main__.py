@@ -28,7 +28,7 @@ CASEDIR = os.path.join(PROJDIR, 'out')
 os.makedirs(CASEDIR, exist_ok=True)
 
 #======================================================================#
-def train(cfg, device):
+def main(cfg, device):
     DISTRIBUTED = mlutils.is_torchrun()
     GLOBAL_RANK = int(os.environ['RANK']) if DISTRIBUTED else 0
 
@@ -201,7 +201,7 @@ if __name__ == "__main__":
     if DISTRIBUTED:
         torch.distributed.barrier()
 
-    train(cfg, device)
+    main(cfg, device)
 
     #===============#
     mlutils.dist_finalize()

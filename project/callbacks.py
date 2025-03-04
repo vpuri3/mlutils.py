@@ -21,7 +21,7 @@ class Callback:
 
     def get_ckpt_dir(self, trainer: mlutils.Trainer):
         if self.final:
-            ckpt_dir = os.path.join(self.case_dir, f'final')
+            ckpt_dir = os.path.join(self.case_dir, f'eval')
         else:
             nsave = trainer.epoch // self.save_every
             ckpt_dir = os.path.join(self.case_dir, f'ckpt{str(nsave).zfill(2)}')
@@ -93,7 +93,7 @@ class Callback:
                 y_pred = transform.unnormalize_y(y_pred_norm)
             
             # Compute relative error
-            rel_error = torch.mean(torch.abs(y - y_pred) / (torch.abs(y) + 1e-8))
+            rel_error = torch.mean(torch.square(y - y_pred) / (torch.square(y) + 1e-8)).sqrt()
             
             if trainer.GLOBAL_RANK == 0:
                 print(f"Relative error: {rel_error.item():.4f}")

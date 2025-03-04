@@ -22,17 +22,27 @@ chmod +x scripts/install.sh
 
 *Training:* You can either run with vanilla python for single GPU training or with `torchrun` for multi-gpu/ multi-node training.
 ```sh
-python -m project --exp_name case1 --dataset dummy --train true --model_type 0 --epochs 100 ...
+python -m project --exp_name case1 --dataset dummy --train true --epochs 100 ...
 ```
 ```sh
-torchrun --nproc-per-node gpu -m project --exp_name case2 --dataset dummy --train true --model_type 0 --epochs 100 ...
+torchrun --nproc-per-node gpu -m project --exp_name case2 --dataset dummy --train true --epochs 100 ...
 ```
 By default all cases are stored in `/out/`.
 ```sh
-[vedantpu@eagle mlutils.py]:tree out/ -L 1
+[vedantpu@eagle mlutils.py]:tree out/ -L 2
 out/
 ├── case1
-└── case2
+    ├── ckpt01
+    ├── ...
+    ├── ckpt10
+    ├── config.yaml
+    └── eval
+└── exp
+    ├── ckpt01
+    ├── ...
+    ├── ckpt10
+    ├── config.yaml
+    └── eval
 ```
 
 *Evaluation/Analysis:* You can load a preexisting case for evaluation or analysis.
