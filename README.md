@@ -53,7 +53,7 @@ This will load the model and save output to a new case directory.
 
 See `python -m project --help` for details
 ```
-(Dummy) [vedantpu@eagle mlutils.py]:python -m project --help
+(MLUtils) [vedantpu@eagle mlutils.py]:python -m project --help
 usage: __main__.py [-h] [--config CONFIG] [--print_config[=flags]] [--train {true,false}] [--eval {true,false}]
                    [--restart_file RESTART_FILE] [--dataset DATASET] [--exp_name EXP_NAME] [--seed SEED]
                    [--model_type MODEL_TYPE] [--width WIDTH] [--num_layers NUM_LAYERS] [--num_heads NUM_HEADS]

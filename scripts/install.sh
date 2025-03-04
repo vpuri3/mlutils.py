@@ -1,7 +1,7 @@
 #
-conda create --name Dummy python=3.11
+conda create --name MLUtils python=3.11
 
-conda activate Dummy
+conda activate MLUtils
 pip install ipython
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install tqdm jsonargparse
