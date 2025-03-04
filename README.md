@@ -37,7 +37,7 @@ out/
     ├── ckpt10
     ├── config.yaml
     └── eval
-└── exp
+└── case2
     ├── ckpt01
     ├── ...
     ├── ckpt10
