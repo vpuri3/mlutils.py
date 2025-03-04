@@ -3,8 +3,8 @@
 Pytorch template for ML projects based off the structre in [GeomLearning.py](https://github.com/vpuri3/GeomLearning.py/tree/master).
 
 Features:
-- Fully equiped for multi-gpu/ multi-node training with `torchrun`
-- Extendable `Trainer` class with checkpointing and restarting enabled via callbacks
+- Equiped for multi-gpu/ multi-node training with `torchrun`
+- Extendable `Trainer` and `Callback` classes with checkpointing, restarts, and analysuis enabled
 - Easy to get started with - just clone the repo and tune it for your application
 
 ## Installation and running
@@ -20,7 +20,7 @@ chmod +x scripts/install.sh
 ./install.sh
 ```
 
-*Training:* You can either run with vanilla python for single GPU training or with `torchrun` for multi-gpu/ multi-node training.
+Training: You can either run with vanilla python for single GPU training or with `torchrun` for multi-gpu/ multi-node training.
 ```sh
 python -m project --exp_name case1 --dataset dummy --train true --epochs 100 ...
 ```
@@ -45,11 +45,11 @@ out/
     └── eval
 ```
 
-*Evaluation/Analysis:* You can load a preexisting case for evaluation or analysis.
+Evaluation/Analysis: You can load a preexisting case for evaluation or analysis.
 ```sh
 python -m project --config /out/case/config.yaml --train false --eval true
 ```
-This will load the model and save output to a new case directory.
+This will load the model, perform any analysis operations via the callback, and save the output to a new case directory.
 
 See `python -m project --help` for details
 ```
