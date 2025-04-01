@@ -5,8 +5,6 @@ import shutil
 from tqdm import tqdm
 
 import torch
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 import mlutils
@@ -98,8 +96,16 @@ class Callback:
             plt.savefig(os.path.join(self.case_dir, 'training_loss.png'))
             plt.close()
 
+        # modify dataset transform
+        if hasattr(self, 'modify_dataset_transform'):
+            self.modify_dataset_transform(trainer, True)
+
         # evaluate model
         self.evaluate(trainer, ckpt_dir)
+
+        # revert dataset transform
+        if hasattr(self, 'modify_dataset_transform'):
+            self.modify_dataset_transform(trainer, False)
 
         # revert self.final
         self.final = False
@@ -107,22 +113,6 @@ class Callback:
         return
 
     def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str):
-        for dataset in [trainer._data, trainer.data_]:
-            transform = dataset.dataset.transform
-            x, y = torch.utils.data.default_collate([dataset[i] for i in range(len(dataset))])
-            x_norm, y_norm = transform(x, y)
-
-            # Get model predictions
-            with torch.no_grad():
-                y_pred_norm = trainer.model(x_norm.to(trainer.device)).to('cpu')
-                y_pred = transform.unnormalize_y(y_pred_norm)
-            
-            # Compute relative error
-            rel_error = torch.mean(torch.square(y - y_pred) / (torch.square(y) + 1e-8)).sqrt()
-            
-            if trainer.GLOBAL_RANK == 0:
-                print(f"Relative error: {rel_error.item():.4f}")
-            
         return
 
 #======================================================================#

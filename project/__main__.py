@@ -77,7 +77,7 @@ def main(cfg, device):
     #=================#
 
     lossfun  = torch.nn.MSELoss()
-    callback = mlutils.Callback(case_dir,)
+    callback = project.RelErrorCallback(case_dir,)
 
     if cfg.train and cfg.epochs > 0:
 
