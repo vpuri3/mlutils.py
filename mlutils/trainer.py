@@ -8,11 +8,10 @@ from tqdm import tqdm
 
 # builtin
 import os
-import math
-import time
 import collections
 
 # local
+from mlutils.schedule import DecayScheduler
 from mlutils.utils import (
     num_parameters, select_device, is_torchrun, check_package_version_lteq,
 )
@@ -40,7 +39,7 @@ class Trainer:
 
         lr=None,
         weight_decay=None,
-        clip_grad=None,
+        clip_grad_norm=None,
 
         Opt=None,
         Schedule=None,
@@ -50,6 +49,10 @@ class Trainer:
         one_cycle_div_factor=25,        # initial_lr = max_lr/div_factor. Default: 25
         one_cycle_final_div_factor=1e4, # min_lr = initial_lr/final_div_factor Default: 1e4
         one_cycle_three_phase=False,    # first two phases will be symmetrical about pct_start third phase: initial_lr -> initial_lr/final_div_factor
+        
+        noise_schedule='linear',
+        noise_init=0.1,
+        noise_min=0.0,
         
         lossfun=None,
         batch_lossfun=None,
@@ -62,10 +65,7 @@ class Trainer:
         print_epoch=True,
         stats_every=1, # stats every k epochs
     ):
-
-        # TODO
-        # - EARLY STOPPING with patience (5 epochs)
-
+        
         ###
         # PRINTING
         ###
@@ -135,7 +135,7 @@ class Trainer:
             lr = 1e-3
         if weight_decay is None:
             weight_decay = 0.0
-        self.clip_grad = clip_grad
+        self.clip_grad_norm = clip_grad_norm
 
         params = self.model.parameters()
 
@@ -158,14 +158,16 @@ class Trainer:
         self.epoch = 0
         self.epochs = 100 if epochs is None else epochs
 
+        bsize = self._batch_size * dist.get_world_size() if self.DISTRIBUTED else self._batch_size
+        self.steps_per_epoch = len(_data) // bsize + 1
+        self.total_steps = self.steps_per_epoch * self.epochs
+
         if Schedule == "OneCycleLR":
-            bsize = self._batch_size * dist.get_world_size() if self.DISTRIBUTED else self._batch_size
-            steps_per_epoch = len(_data) // bsize + 1
             self.schedule = optim.lr_scheduler.OneCycleLR(
                 self.opt,
                 max_lr=lr,
                 epochs=epochs,
-                steps_per_epoch=steps_per_epoch,
+                steps_per_epoch=self.steps_per_epoch,
                 pct_start=one_cycle_pct_start,
                 div_factor=one_cycle_div_factor,
                 final_div_factor=one_cycle_final_div_factor,
@@ -173,7 +175,7 @@ class Trainer:
             )
             self.update_schedule_every_epoch = False
         elif Schedule == "CosineAnnealingLR":
-            self.schedule = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.epochs, eta_min=1e-6)
+            self.schedule = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.epochs, eta_min=0.)
             self.update_schedule_every_epoch = True
         elif Schedule is None:
             self.schedule = optim.lr_scheduler.ConstantLR(self.opt, factor=1.0, total_iters=1e10)
@@ -181,43 +183,31 @@ class Trainer:
         else:
             raise NotImplementedError()
         
-        self.config = {
-            "device" : device,
-            "gnn_loader" : self.gnn_loader,
-
-            "data_size" : len(self._data),
-            "num_batches" : len(self._data) // self._batch_size,
-            "batch_size" : _batch_size,
-
-            "num_parameters" : num_parameters(self.model),
-
-            "learning_rate" : lr,
-            "weight_decay" : weight_decay,
-            # "optimizer" : str(self.opt),
-            "schedule"  : str(self.schedule),
-
-            "epochs" : self.epochs,
-            "lossfun" : str(self.lossfun),
-        }
-
-        if verbose and print_config and (self.GLOBAL_RANK == 0):
-            print(model)
-            print(f"Trainer config:")
-            for (k, v) in config.items():
-                print(f"{k} : {v}")
-
+        self.noise_schedule = DecayScheduler(
+            total_steps=self.total_steps,
+            decay_type=noise_schedule,
+            init_val=noise_init,
+            min_val=noise_min,
+        )
+        
         ###
         # STATISTICS
         ###
 
         self.statsfun = statsfun
-        self.callbacks = collections.defaultdict(list)
+        self.training_loss = []
         self.stat_vals = {
             "train_loss" : None,
             "test_loss" : None,
             "train_stats" : None,
             "test_stats" : None,
         }
+        
+        ###
+        # Callbacks
+        ###
+
+        self.callbacks = collections.defaultdict(list)
 
     #------------------------#
     # CALLBACKS
@@ -250,6 +240,7 @@ class Trainer:
             snapshot['model_state'] = self.model.state_dict()
         snapshot['opt_state'] = self.opt.state_dict()
         snapshot['schedule_state'] = None if (self.schedule is None) else self.schedule.state_dict()
+        snapshot['training_loss'] = self.training_loss
 
         torch.save(snapshot, save_path)
 
@@ -265,13 +256,16 @@ class Trainer:
             snapshot = torch.load(load_path, weights_only=False, map_location=self.device)
 
         self.epoch = snapshot['epoch']
-
         if self.DDP:
             self.model.module.load_state_dict(snapshot['model_state'])
         else:
             self.model.load_state_dict(snapshot['model_state'])
-
         self.opt.load_state_dict(snapshot['opt_state'])
+        self.schedule.load_state_dict(snapshot['schedule_state'])
+        self.training_loss = snapshot['training_loss']
+        
+        # noise schedul
+        self.noise_schedule.set_current_step(self.epoch * self.steps_per_epoch)
 
     #------------------------#
     # DATALOADER
@@ -280,32 +274,31 @@ class Trainer:
     def make_dataloader(self):
         if self.gnn_loader:
             import torch_geometric as pyg
-
             DL = pyg.loader.DataLoader
         else:
             DL = torch.utils.data.DataLoader
 
         if self.DDP:
             DS = torch.utils.data.distributed.DistributedSampler
-            _shuffle, __shuffle = False, False
-            _sampler, __sampler = DS(self._data), DS(self._data, shuffle=False)
+            _shuffle, _shuffle_ = False, False
+            _sampler, _sampler_ = DS(self._data), DS(self._data, shuffle=False)
 
             if self.data_ is not None:
                 shuffle_ = False
                 sampler_ = DS(self.data_, shuffle=False)
-            else: # unused
+            else:
                 shuffle_ = False
                 sampler_ = None
         else:
-            _shuffle, __shuffle, shuffle_ = True, False, False
-            _sampler, __sampler, sampler_ = None, None , None
+            _shuffle, _shuffle_, shuffle_ = True, False, False
+            _sampler, _sampler_, sampler_ = None, None , None
 
-        _args  = dict(shuffle= _shuffle, sampler= _sampler)
-        __args = dict(shuffle=__shuffle, sampler=__sampler)
+        _args  = dict(shuffle=_shuffle , sampler=_sampler )
+        _args_ = dict(shuffle=_shuffle_, sampler=_sampler_)
         args_  = dict(shuffle=shuffle_ , sampler=sampler_ )
 
-        self._loader  = DL(self._data, batch_size=self._batch_size , collate_fn=self.collate_fn, **_args,)
-        self._loader_ = DL(self._data, batch_size=self._batch_size_, collate_fn=self.collate_fn, **__args,)
+        self._loader  = DL(self._data, batch_size=self._batch_size , collate_fn=self.collate_fn, **_args )
+        self._loader_ = DL(self._data, batch_size=self._batch_size_, collate_fn=self.collate_fn, **_args_)
 
         if self.data_ is not None:
             self.loader_ = DL(self.data_, batch_size=self.batch_size_, collate_fn=self.collate_fn, **args_)
@@ -381,13 +374,17 @@ class Trainer:
             self.opt.zero_grad()
             self.trigger_callbacks("batch_start")
 
+            self.noise_schedule.step()
+
             self.model.train()
             loss = self.batch_loss(batch)
             loss.backward()
 
+            self.training_loss.append(loss.item())
+
             self.trigger_callbacks("batch_post_grad")
-            if self.clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+            if self.clip_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
 
             self.opt.step()
             self.trigger_callbacks("batch_end")
@@ -430,15 +427,13 @@ class Trainer:
 
         return loss
 
-    def get_batch_size(self, batch):
-        if self.gnn_loader:
-            return batch.y.size(0)
-        else:
-            return batch[1].size(0)
-
     #------------------------#
     # STATISTICS
     #------------------------#
+
+    def get_batch_size(self, batch, loader):
+        bs = batch.num_graphs if self.gnn_loader else batch[0].size(0)
+        return min(bs, loader.batch_size)
 
     @torch.no_grad()
     def evaluate(self, loader):
@@ -446,11 +441,11 @@ class Trainer:
 
         N, L = 0, 0.0
         for batch in loader:
-            n = self.get_batch_size(batch)
+            n = self.get_batch_size(batch, loader)
             l = self.batch_loss(batch).item()
             N += n
             L += l * n
-
+            
         if self.DDP:
             L = torch.tensor(L, device=self.device)
             N = torch.tensor(N, device=self.device)
@@ -466,6 +461,7 @@ class Trainer:
         return loss, None
 
     def statistics(self):
+        
         _loss, _stats = self.evaluate(self._loader_)
 
         if self.loader_ is not None:
@@ -493,7 +489,7 @@ class Trainer:
             "train_stats" : _stats,
             "test_stats" : stats_,
         }
-
+        
         return
 #======================================================================#
 #
