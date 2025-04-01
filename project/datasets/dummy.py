@@ -27,14 +27,14 @@ class DummyDataset(torch.utils.data.Dataset):
 
             torch.save(x, os.path.join(self.root, 'x.pt'))
 
-        self.x = torch.load(os.path.join(self.root, 'x.pt'))
+        self.x = torch.load(os.path.join(self.root, 'x.pt'), weights_only=True)
 
         if not os.path.exists(os.path.join(self.root, 'y.pt')):
             print(f"y.pt file not found in {self.root}. Creating it.")
             y = torch.sin(torch.pi * self.x[..., 0:1]) * torch.sin(torch.pi * self.x[..., 1:2])
             torch.save(y, os.path.join(self.root, 'y.pt'))
         
-        self.y = torch.load(os.path.join(self.root, 'y.pt'))
+        self.y = torch.load(os.path.join(self.root, 'y.pt'), weights_only=True)
         
         self.transform.fit(self.x, self.y)
         

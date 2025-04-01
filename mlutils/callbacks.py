@@ -5,6 +5,9 @@ import shutil
 from tqdm import tqdm
 
 import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 import mlutils
 
@@ -54,8 +57,8 @@ class Callback:
             if self.save_every is None:
                 self.save_every = trainer.stats_every
             if trainer.epoch == 0:
-                return
-                # pass
+                # return
+                pass
             if (trainer.epoch % self.save_every) != 0:
                 return
         #------------------------#
@@ -72,6 +75,28 @@ class Callback:
             print(f"Saving stats to {ckpt_dir}/stats.json")
             with open(os.path.join(ckpt_dir, 'stats.json'), 'w') as f:
                 json.dump(trainer.stat_vals, f)
+
+        # save training loss plot
+        if trainer.GLOBAL_RANK == 0:
+            print(f"Saving loss plot to {self.case_dir}/training_loss.png")
+            plt.figure(figsize=(8, 4), dpi=175)
+            training_loss = trainer.training_loss
+            if isinstance(training_loss, list):
+                training_loss = torch.tensor(training_loss)
+            training_loss[training_loss < 1e-12] = torch.nan
+            plt.plot(training_loss, color='k', label='Training Loss')
+            plt.xlabel('Step')
+            plt.ylabel('Loss')
+            plt.yscale('log')
+            if trainer.stat_vals['train_loss'] is not None:
+                plt.title('Training Loss, final: {:.2e}'.format(trainer.stat_vals['train_loss']))
+            else:
+                plt.title('Training Loss')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(ckpt_dir, 'training_loss.png'))
+            plt.savefig(os.path.join(self.case_dir, 'training_loss.png'))
+            plt.close()
 
         # evaluate model
         self.evaluate(trainer, ckpt_dir)
