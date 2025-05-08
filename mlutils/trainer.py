@@ -105,10 +105,12 @@ class Trainer:
 
         self._data = _data
         self.data_ = data_
-
+        
         self._batch_size = 1 if _batch_size is None else _batch_size
         self._batch_size_ = len(_data) if _batch_size_ is None else _batch_size_
         self.batch_size_ = batch_size_
+
+        assert self._batch_size % self.WORLD_SIZE == 0, f"Batch size {self._batch_size} must be divisible by world size {self.WORLD_SIZE}."
 
         if (data_ is not None) and (batch_size_ is None):
             self.batch_size_ = len(data_)
@@ -132,12 +134,13 @@ class Trainer:
         # OPTIMIZER
         ###
 
+        adam_betas = (0.9, 0.999) if adam_betas is None else adam_betas
+
         if lr is None:
             lr = 1e-3
         if weight_decay is None:
             weight_decay = 0.0
         if make_optimizer is None:
-            adam_betas = (0.9, 0.999) if adam_betas is None else adam_betas
             self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay, betas=adam_betas)
         else:
             self.opt = make_optimizer(model=self.model, lr=lr, weight_decay=weight_decay, adam_betas=adam_betas)
@@ -157,9 +160,7 @@ class Trainer:
 
         self.epoch = 0
         self.epochs = 100 if epochs is None else epochs
-
-        bsize = self._batch_size * dist.get_world_size() if self.DISTRIBUTED else self._batch_size
-        self.steps_per_epoch = len(_data) // bsize + 1
+        self.steps_per_epoch = len(_data) // self._batch_size + 1
         self.total_steps = self.steps_per_epoch * self.epochs
 
         if Schedule == "OneCycleLR":
