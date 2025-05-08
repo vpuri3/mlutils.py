@@ -41,7 +41,8 @@ class Trainer:
         weight_decay=None,
         clip_grad_norm=None,
 
-        Opt=None,
+        make_optimizer=None, # (model, lr, weight_decay, adam_betas) -> optimizer
+        adam_betas=None,
         Schedule=None,
         
         # OneCycleLR schedule
@@ -49,7 +50,7 @@ class Trainer:
         one_cycle_div_factor=25,        # initial_lr = max_lr/div_factor. Default: 25
         one_cycle_final_div_factor=1e4, # min_lr = initial_lr/final_div_factor Default: 1e4
         one_cycle_three_phase=False,    # first two phases will be symmetrical about pct_start third phase: initial_lr -> initial_lr/final_div_factor
-        
+
         noise_schedule='linear',
         noise_init=0.1,
         noise_min=0.0,
@@ -105,7 +106,7 @@ class Trainer:
         self._data = _data
         self.data_ = data_
 
-        self._batch_size = 32 if _batch_size is None else _batch_size
+        self._batch_size = 1 if _batch_size is None else _batch_size
         self._batch_size_ = len(_data) if _batch_size_ is None else _batch_size_
         self.batch_size_ = batch_size_
 
@@ -135,14 +136,13 @@ class Trainer:
             lr = 1e-3
         if weight_decay is None:
             weight_decay = 0.0
-        self.clip_grad_norm = clip_grad_norm
-
-        params = self.model.parameters()
-
-        if (Opt == "Adam") or (Opt == "AdamW") or (Opt is None):
-            self.opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        if make_optimizer is None:
+            adam_betas = (0.9, 0.999) if adam_betas is None else adam_betas
+            self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay, betas=adam_betas)
         else:
-            raise NotImplementedError()
+            self.opt = make_optimizer(model=self.model, lr=lr, weight_decay=weight_decay, adam_betas=adam_betas)
+
+        self.clip_grad_norm = clip_grad_norm
 
         ###
         # LOSS CALCULATION
@@ -299,12 +299,16 @@ class Trainer:
         _args  = dict(shuffle=_shuffle , sampler=_sampler )
         _args_ = dict(shuffle=_shuffle_, sampler=_sampler_)
         args_  = dict(shuffle=shuffle_ , sampler=sampler_ )
+        
+        _batch_size  = self._batch_size // self.WORLD_SIZE if self.DISTRIBUTED else self._batch_size
+        _batch_size_ = self._batch_size_
+        batch_size_  = self.batch_size_
 
-        self._loader  = DL(self._data, batch_size=self._batch_size , collate_fn=self.collate_fn, **_args )
-        self._loader_ = DL(self._data, batch_size=self._batch_size_, collate_fn=self.collate_fn, **_args_)
+        self._loader  = DL(self._data, batch_size=_batch_size , collate_fn=self.collate_fn, **_args )
+        self._loader_ = DL(self._data, batch_size=_batch_size_, collate_fn=self.collate_fn, **_args_)
 
         if self.data_ is not None:
-            self.loader_ = DL(self.data_, batch_size=self.batch_size_, collate_fn=self.collate_fn, **args_)
+            self.loader_ = DL(self.data_, batch_size=batch_size_, collate_fn=self.collate_fn, **args_)
         else:
             self.loader_ = None
 
@@ -344,7 +348,7 @@ class Trainer:
         self.trigger_callbacks("epoch_start")
         self.statistics()
         self.trigger_callbacks("epoch_end")
-
+        
         while self.epoch < self.epochs:
             self.epoch += 1
 
@@ -405,15 +409,18 @@ class Trainer:
                 )
 
         return
+    
+    def move_to_device(self, x):
+        return x.to(self.device) if isinstance(x, torch.Tensor) else x
 
     def batch_loss(self, batch):
         if self.batch_lossfun is not None:
             if isinstance(batch, tuple) or isinstance(batch, list):
-                batch = [x.to(self.device) for x in batch]
+                batch = [self.move_to_device(x) for x in batch]
             elif isinstance(batch, dict):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: self.move_to_device(v) for k, v in batch.items()}
             elif isinstance(batch, torch.Tensor):
-                batch = batch.to(self.device)
+                batch = self.move_to_device(batch)
             else:
                 batch = batch.to(self.device)
             loss = self.batch_lossfun(self, self.model, batch)
