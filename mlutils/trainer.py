@@ -62,7 +62,7 @@ class Trainer:
         # noise_init=0.1,
         # noise_min=0.0,
 
-        lossfun=None,
+        lossfun=None, # (pred, target) -> loss
         batch_lossfun=None, # (trainer, model, batch) -> loss
         epochs=None,
 
@@ -196,8 +196,12 @@ class Trainer:
         ###
         # LOSS CALCULATION
         ###
-
-        self.lossfun = nn.MSELoss() if lossfun is None else lossfun
+        
+        if (lossfun is None) and (batch_lossfun is None):
+            raise ValueError("Either lossfun or batch_lossfun must be provided. Got None for both.")
+        
+        # TODO: only use batch_lossfun everywhere
+        self.lossfun = lossfun
         self.batch_lossfun = batch_lossfun
 
         ###
@@ -257,7 +261,7 @@ class Trainer:
         self.num_steps_fullbatch  = []
         self.train_loss_fullbatch = []
         self.test_loss_fullbatch  = []
-        
+
         ###
         # Callbacks
         ###

@@ -1,16 +1,13 @@
 #!/bin/bash
 #=========================================#
-# # Eagle
-# TORCH_VERSION=2.6
-# CUDA_VERSION=cu124
+# Eagle, Orchard
+TORCH_VERSION=2.6
+CUDA_VERSION=cu124
 #=========================================#
 # # GCloud H100
 # TORCH_VERSION=2.7
 # CUDA_VERSION=cu128
 #=========================================#
-# Orchard
-TORCH_VERSION=2.6
-CUDA_VERSION=cu124
 
 #=========================================#
 # Update uv

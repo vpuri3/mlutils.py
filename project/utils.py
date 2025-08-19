@@ -1,8 +1,12 @@
 #
 import torch
+import torch.nn as nn
+from torch.optim.optimizer import Optimizer
 
 __all__ = [
-    'NormalizeTransform',
+    'make_optimizer_adamw',
+    'make_optimizer_lion',
+    #
     'IdentityNormalizer',
     'UnitCubeNormalizer',
     'UnitGaussianNormalizer',
@@ -10,39 +14,120 @@ __all__ = [
 ]
 
 #======================================================================#
+def split_params(model):
+    decay = []
+    no_decay = []
 
-class NormalizeTransform:
-    def __init__(self):
-        pass
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # skip frozen weights
+        if name.endswith(".bias") or "LayerNorm" in name or "layernorm" in name or "embedding" in name.lower():
+            no_decay.append(param)
+        elif 'latent' in name:
+            no_decay.append(param)
+        elif 'cls_token' in name:
+            no_decay.append(param)
+        elif 'pos_embed' in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
 
-    def fit(self, x, y):
-        # Compute normalization parameters for x (unit cube)
-        self.x_min = x.amin(dim=(0, 1), keepdim=True)
-        self.x_max = x.amax(dim=(0, 1), keepdim=True)
-        # Compute normalization parameters for y (zero mean, unit variance)
-        self.y_mean = y.mean(dim=(0, 1), keepdim=True)
-        self.y_std = y.std(dim=(0, 1), keepdim=True)
+    return decay, no_decay
 
-    def __call__(self, x, y):
-        # Normalize x to unit cube [0, 1]
-        x_norm = (x - self.x_min) / (self.x_max - self.x_min)
+#======================================================================#
+def make_optimizer_adamw(model, lr, weight_decay=0.0, betas=None, eps=None, **kwargs):
+    betas = betas if betas is not None else (0.9, 0.999)
+    eps = eps if eps is not None else 1e-8
 
-        # Normalize y to zero mean and unit variance
-        y_norm = (y - self.y_mean) / self.y_std
+    decay, no_decay = split_params(model)
 
-        return x_norm, y_norm
+    optimizer = torch.optim.AdamW([
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0}
+    ], lr=lr, betas=betas, eps=eps)
 
-    def unnormalize_x(self, x_norm):
-        # Unnormalize x from unit cube
-        x = x_norm * (self.x_max - self.x_min) + self.x_min
+    return optimizer
 
-        return x
+def make_optimizer_lion(model, lr, weight_decay=0.0, betas=None, eps=None, **kwargs):
+    betas = betas if betas is not None else (0.9, 0.999)
+    eps = eps if eps is not None else 1e-8
 
-    def unnormalize_y(self, y_norm):
-        # Unnormalize y from zero mean, unit variance
-        y = y_norm * self.y_std + self.y_mean
+    decay, no_decay = split_params(model)
+    
+    optimizer = Lion([
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0}
+    ], lr=lr, betas=betas, eps=eps)
 
-        return y
+    return optimizer
+
+#======================================================================#
+
+class Lion(Optimizer):
+    r"""
+    Lion Optimizer (Chen et al., 2023):
+    https://arxiv.org/abs/2302.06675
+
+    Update rule:
+        m_t = beta1 * m_{t-1} + (1 - beta1) * grad
+        w_{t+1} = w_t - lr * sign(m_t)
+
+    Args:
+        params (iterable): iterable of parameters to optimize
+        lr (float): learning rate
+        betas (Tuple[float, float]): momentum coefficients (beta1, beta2). Note that beta2 is not used.
+        weight_decay (float): optional weight decay (L2 penalty)
+        eps (float): optional epsilon. Note that eps is not used.
+    """
+
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0, eps=1e-8):
+        if lr <= 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if eps <= 0.0:
+            raise ValueError(f"Invalid eps: {eps}")
+
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, eps=eps)
+        super(Lion, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+
+                # Apply weight decay directly to weights
+                if wd != 0:
+                    grad = grad.add(p, alpha=wd)
+
+                # State (momentum) initialization
+                state = self.state[p]
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(p)
+
+                exp_avg = state["exp_avg"]
+
+                # Momentum update
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+                # Parameter update (sign of momentum)
+                p.add_(exp_avg.sign(), alpha=-lr)
+
+        return loss
 
 #======================================================================#
 class IdentityNormalizer():
@@ -61,27 +146,24 @@ class IdentityNormalizer():
 #======================================================================#
 class UnitCubeNormalizer():
     def __init__(self, X):
-        xmin = X[:,:,0].min().item()
-        ymin = X[:,:,1].min().item()
+        mins = X.amin(dim=(0, 1), keepdim=True)
+        maxs = X.amax(dim=(0, 1), keepdim=True)
 
-        xmax = X[:,:,0].max().item()
-        ymax = X[:,:,1].max().item()
-
-        self.min = torch.tensor([xmin, ymin])
-        self.max = torch.tensor([xmax, ymax])
+        self.mins = mins
+        self.maxs = maxs
 
     def to(self, device):
-        self.min = self.min.to(device)
-        self.max = self.max.to(device)
+        self.mins = self.mins.to(device)
+        self.maxs = self.maxs.to(device)
 
         return self
 
     def encode(self, x):
-        x = (x - self.min) / (self.max - self.min)
+        x = (x - self.mins) / (self.maxs - self.mins)
         return x
 
     def decode(self, x):
-        return x * (self.max - self.min) + self.min
+        return x * (self.maxs - self.mins) + self.mins
 
 #======================================================================#
 class UnitGaussianNormalizer():
