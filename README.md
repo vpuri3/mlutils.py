@@ -42,19 +42,9 @@ mlutils.py/
 ### Quick Install
 
 ```bash
-git clone <repository-url>
+git clone git@github.com:vpuri3/mlutils.py.git
 cd mlutils.py
-pip install -e .
-```
-
-### Development Install
-
-For development with additional tools:
-
-```bash
-git clone <repository-url>
-cd mlutils.py
-pip install -e ".[dev]"
+./scripts/install.sh
 ```
 
 ## 🎯 Quick Start
@@ -63,24 +53,24 @@ pip install -e ".[dev]"
 
 Single GPU training:
 ```bash
-python -m project --train true --dataset dummy --exp_name my_experiment --epochs 50
+python -m project --train true --dataset dummy --exp_name my_experiment --mdoel_type 0 --epochs 50
 ```
 
 Multi-GPU training:
 ```bash
-torchrun --nproc-per-node 2 -m project --train true --dataset dummy --exp_name my_experiment --epochs 50
-```
-
-### Evaluating a Model
-
-```bash
-python -m project --evaluate true --exp_name my_experiment
+torchrun --nproc-per-node 2 -m project --train true --dataset dummy --exp_name my_experiment --model_type 0 --epochs 50
 ```
 
 ### Resuming from Checkpoint
 
 ```bash
 python -m project --restart true --exp_name my_experiment
+```
+
+### Evaluating a Model
+
+```bash
+python -m project --evaluate true --exp_name my_experiment
 ```
 
 ## ⚙️ Configuration
@@ -91,7 +81,7 @@ The framework uses YAML configuration files with command-line overrides. Key con
 python -m project --help
 ```
 
-### Training Parameters
+### Training Parameters include
 - `--epochs`: Number of training epochs (default: 100)
 - `--batch_size`: Batch size (default: 4)
 - `--learning_rate`: Learning rate (default: 1e-3)
@@ -99,7 +89,7 @@ python -m project --help
 - `--optimizer`: Optimizer choice (adamw, lion)
 - `--mixed_precision`: Enable mixed precision training (default: true)
 
-### Model Parameters
+### Model Parameters for a standard transformer implementation include
 - `--model_type`: Model type (0: Transformer)
 - `--channel_dim`: Model hidden dimension (default: 64)
 - `--num_blocks`: Number of transformer blocks (default: 4)
@@ -209,10 +199,11 @@ out/
     ├── ckpt01/              # Checkpoints (model + optimizer state)
     ├── ckpt02/
     ├── ...
-    ├── losses.png           # Training/validation loss plots
-    ├── learning_rate.png    # Learning rate schedule
+    ├── ckpt10/
     ├── grad_norm.png        # Gradient norm tracking
-    └── rel_error.json       # Final evaluation metrics
+    ├── learning_rate.png    # Learning rate schedule
+    ├── losses.png           # Training/validation loss plots
+    └── model_stats.json     # Memory/ timing statistics
 ```
 
 ## 🔧 Advanced Features
