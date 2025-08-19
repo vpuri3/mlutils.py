@@ -21,7 +21,6 @@ __all__ = [
     "num_parameters",
 
     "mean_std",
-    "shift_scale",
     "normalize",
     "unnormalize",
 
@@ -40,9 +39,15 @@ def to_numpy(t: torch.Tensor):
     return t.detach().cpu().resolve_conj().resolve_neg().numpy()
 
 def check_package_version_lteq(pkg: str, version: str):
-    import pkg_resources
-    VERSION = pkg_resources.get_distribution(pkg).version
-    return pkg_resources.parse_version(VERSION) <= pkg_resources.parse_version(version)
+    import importlib.metadata
+    from packaging import version as packaging_version
+    
+    try:
+        current_version = importlib.metadata.version(pkg)
+        return packaging_version.parse(current_version) <= packaging_version.parse(version)
+    except importlib.metadata.PackageNotFoundError:
+        # If package not found, assume it doesn't meet the version requirement
+        return False
 
 #=======================================================================#
 def set_seed(seed = 0):
@@ -51,8 +56,15 @@ def set_seed(seed = 0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    try:
+        torch.set_float32_matmul_precision('high')
+        print(f"Setting float32 matmul precision to high")
+    except:
+        print(f"Could not set float32 matmul precision to high.")
+
     return
 
 #=======================================================================#
@@ -155,23 +167,6 @@ def mean_std(x: torch.tensor, channel_dim=-1):
 
     return x_bar, x_std
 
-def shift_scale(x: torch.tensor, min, max, channel_dim=-1, keepdim=False):
-    """
-    y = (x - x_min) * (max - min) / (x_max - x_min) + min
-    """
-    dims = list(range(x.ndim))
-    del dims[channel_dim]
-    keepdim = (channel_dim != -1) and (channel_dim != x.ndim-1)
-
-    x_min = x_max = x
-    for dim in reversed(dims):
-        x_min = x_min.min(dim=dim, keepdim=keepdim).values
-        x_max = x_max.max(dim=dim, keepdim=keepdim).values
-
-    scale = (x_max - x_min) / (max - min)
-    shift = x_min - min * scale
-    return shift, scale
-
 def normalize(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x - shift) / scale
 
@@ -187,7 +182,7 @@ def r2(y_pred, y_true):
     y_mean = torch.mean(y_true)
     ss_res = torch.sum((y_true - y_pred) ** 2)
     ss_tot = torch.sum((y_true - y_mean) ** 2)
-    r2 = 1 - ss_res / ss_tot
+    r2 = 1 - ss_res / (ss_tot + 1e-6)
     return r2.item()
 
 #=======================================================================#

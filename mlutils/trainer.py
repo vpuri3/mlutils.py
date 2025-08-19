@@ -1,5 +1,5 @@
 #
-# 3rd party
+import time
 import torch
 from torch import nn, optim
 from torch import distributed as dist
@@ -31,8 +31,12 @@ class Trainer:
 
         gnn_loader=False,
         device=None,
+        mixed_precision=False,
+        attn_backend=None, # ['math', 'flash', 'efficient', 'cudnn']
 
         collate_fn=None,
+        num_workers=0,
+        prefetch_factor=2,
         _batch_size=None,  # bwd over _data
         batch_size_=None,  # fwd over data_
         _batch_size_=None, # fwd over _data
@@ -41,32 +45,35 @@ class Trainer:
         weight_decay=None,
         clip_grad_norm=None,
 
-        make_optimizer=None, # (model, lr, weight_decay, adam_betas) -> optimizer
-        adam_betas=None,
+        make_optimizer=None, # (model, lr, weight_decay, betas, eps) -> optimizer
+        opt_betas=None,
+        opt_eps=None,
+
         Schedule=None,
-        
+        drop_last_batch=True,
+
         # OneCycleLR schedule
         one_cycle_pct_start=0.3,        # % of cycle spent increasing LR. Default: 0.3
         one_cycle_div_factor=25,        # initial_lr = max_lr/div_factor. Default: 25
         one_cycle_final_div_factor=1e4, # min_lr = initial_lr/final_div_factor Default: 1e4
         one_cycle_three_phase=False,    # first two phases will be symmetrical about pct_start third phase: initial_lr -> initial_lr/final_div_factor
 
-        noise_schedule='linear',
-        noise_init=0.1,
-        noise_min=0.0,
-        
+        # noise_schedule='linear',
+        # noise_init=0.1,
+        # noise_min=0.0,
+
         lossfun=None,
-        batch_lossfun=None,
+        batch_lossfun=None, # (trainer, model, batch) -> loss
         epochs=None,
 
-        statsfun=None,
+        statsfun=None, # (trainer, loader) -> (loss, stats)
         verbose=True,
         print_config=False,
         print_batch=True,
         print_epoch=True,
         stats_every=1, # stats every k epochs
     ):
-        
+
         ###
         # PRINTING
         ###
@@ -93,8 +100,33 @@ class Trainer:
         else:
             self.DDP = False
             self.device = select_device(device, verbose=True)
-            
+
         self.is_cuda = self.device not in ['cpu', torch.device('cpu')]
+        self.device_type = self.device.type if isinstance(self.device, torch.device) else self.device
+
+        ###
+        # PRECISION & ATTENTION BACKEND
+        ###
+
+        self.mixed_precision = mixed_precision
+        self.auto_cast = torch.autocast(device_type=self.device_type, enabled=self.mixed_precision)
+        self.grad_scaler = torch.amp.GradScaler(device=self.device_type, enabled=self.mixed_precision)
+
+        if attn_backend is None:
+            self.attn_backend = None
+        elif attn_backend == 'math':
+            self.attn_backend = torch.nn.attention.SDPBackend.MATH
+        elif attn_backend == 'flash':
+            self.attn_backend = torch.nn.attention.SDPBackend.FLASH_ATTENTION
+        elif attn_backend == 'efficient':
+            self.attn_backend = torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION
+        elif attn_backend == 'cudnn':
+            self.attn_backend = torch.nn.attention.SDPBackend.CUDNN_ATTENTION
+        else:
+            raise ValueError(f"Invalid attention backend: {attn_backend}. Must be one of: 'math', 'flash', 'efficient', 'cudnn'.")
+
+        if self.GLOBAL_RANK == 0 and self.attn_backend is not None:
+            print(f"Using SDPA backend: {self.attn_backend}")
 
         ###
         # DATA
@@ -105,27 +137,39 @@ class Trainer:
 
         self._data = _data
         self.data_ = data_
-        
+
         self._batch_size = 1 if _batch_size is None else _batch_size
         self._batch_size_ = len(_data) if _batch_size_ is None else _batch_size_
         self.batch_size_ = batch_size_
+        self.drop_last_batch = drop_last_batch
 
         assert self._batch_size % self.WORLD_SIZE == 0, f"Batch size {self._batch_size} must be divisible by world size {self.WORLD_SIZE}."
 
         if (data_ is not None) and (batch_size_ is None):
             self.batch_size_ = len(data_)
 
+        self.num_workers = num_workers if num_workers != 0 else os.cpu_count() // self.WORLD_SIZE
+        self.num_workers = min(self.num_workers, max(self._batch_size, self.batch_size_, self._batch_size_))
+
         self.collate_fn = collate_fn
+        self.prefetch_factor = prefetch_factor
         self.gnn_loader = gnn_loader
 
         ###
         # MODEL
         ###
 
-        if self.verbose and (self.GLOBAL_RANK == 0):
-            print(f"Moving model with {num_parameters(model)} parameters to device {device}")
+        self.model = model.to(self.device)
 
-        self.model = model.to(device)
+        if self.verbose and (self.GLOBAL_RANK == 0):
+            print(f"Compiling model with {num_parameters(self.model)} parameters to device {self.device}")
+
+        try:
+            self.model = torch.compile(self.model)
+        except:
+            if self.verbose and (self.GLOBAL_RANK == 0):
+                print(f"Compilation failed. Running along anyways.")
+            pass
 
         if self.DDP:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[device])
@@ -134,18 +178,20 @@ class Trainer:
         # OPTIMIZER
         ###
 
-        adam_betas = (0.9, 0.999) if adam_betas is None else adam_betas
-
         if lr is None:
             lr = 1e-3
         if weight_decay is None:
             weight_decay = 0.0
-        if make_optimizer is None:
-            self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay, betas=adam_betas)
+        if make_optimizer is not None:
+            if self.GLOBAL_RANK == 0:
+                print(f"Using custom optimizer: {make_optimizer.__name__} with lr={lr}, weight_decay={weight_decay}, betas={opt_betas}, eps={opt_eps}")
+            self.opt = make_optimizer(model=self.model, lr=lr, weight_decay=weight_decay, betas=opt_betas, eps=opt_eps)
         else:
-            self.opt = make_optimizer(model=self.model, lr=lr, weight_decay=weight_decay, adam_betas=adam_betas)
+            opt_betas = (0.9, 0.999) if opt_betas is None else opt_betas
+            opt_eps = 1e-8 if opt_eps is None else opt_eps
+            self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay, betas=opt_betas, eps=opt_eps)
 
-        self.clip_grad_norm = clip_grad_norm
+        self.clip_grad_norm = clip_grad_norm if clip_grad_norm is not None else torch.inf
 
         ###
         # LOSS CALCULATION
@@ -175,6 +221,9 @@ class Trainer:
                 three_phase=one_cycle_three_phase,
             )
             self.update_schedule_every_epoch = False
+        elif Schedule == "CosineAnnealingWarmRestarts":
+            self.schedule = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.opt, T_0=self.epochs, T_mult=1, eta_min=0.)
+            self.update_schedule_every_epoch = True
         elif Schedule == "CosineAnnealingLR":
             self.schedule = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.epochs, eta_min=0.)
             self.update_schedule_every_epoch = True
@@ -184,22 +233,24 @@ class Trainer:
         else:
             raise NotImplementedError()
         
-        self.noise_schedule = DecayScheduler(
-            total_steps=self.total_steps,
-            decay_type=noise_schedule,
-            init_val=noise_init,
-            min_val=noise_min,
-        )
+        # self.noise_schedule = DecayScheduler(
+        #     total_steps=self.total_steps,
+        #     decay_type=noise_schedule,
+        #     init_val=noise_init,
+        #     min_val=noise_min,
+        # )
         
         ###
         # STATISTICS
         ###
+        
+        self.is_training = False
 
         self.statsfun = statsfun
         self.stat_vals = {
             "train_loss" : None,
-            "test_loss" : None,
             "train_stats" : None,
+            "test_loss" : None,
             "test_stats" : None,
         }
         self.train_loss_per_batch = []
@@ -268,8 +319,8 @@ class Trainer:
         self.schedule.load_state_dict(snapshot['schedule_state'])
         self.train_loss_per_batch = snapshot['train_loss_per_batch']
         
-        # noise schedul
-        self.noise_schedule.set_current_step(self.epoch * self.steps_per_epoch)
+        # # noise schedul
+        # self.noise_schedule.set_current_step(self.epoch * self.steps_per_epoch)
 
     #------------------------#
     # DATALOADER
@@ -296,20 +347,27 @@ class Trainer:
         else:
             _shuffle, _shuffle_, shuffle_ = True, False, False
             _sampler, _sampler_, sampler_ = None, None , None
+            
+        dl_args = dict(
+            num_workers=self.num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=True,
+            prefetch_factor=self.prefetch_factor,
+        )
 
-        _args  = dict(shuffle=_shuffle , sampler=_sampler )
-        _args_ = dict(shuffle=_shuffle_, sampler=_sampler_)
-        args_  = dict(shuffle=shuffle_ , sampler=sampler_ )
-        
+        _args  = dict(shuffle=_shuffle , sampler=_sampler , **dl_args, drop_last=self.drop_last_batch)
+        _args_ = dict(shuffle=_shuffle_, sampler=_sampler_, **dl_args)
+        args_  = dict(shuffle=shuffle_ , sampler=sampler_ , **dl_args)
+
         _batch_size  = self._batch_size // self.WORLD_SIZE if self.DISTRIBUTED else self._batch_size
         _batch_size_ = self._batch_size_
         batch_size_  = self.batch_size_
 
-        self._loader  = DL(self._data, batch_size=_batch_size , collate_fn=self.collate_fn, **_args )
-        self._loader_ = DL(self._data, batch_size=_batch_size_, collate_fn=self.collate_fn, **_args_)
-
+        self._loader  = DL(self._data, batch_size=_batch_size , **_args , persistent_workers=True)
+        self._loader_ = DL(self._data, batch_size=_batch_size_, **_args_)
+        
         if self.data_ is not None:
-            self.loader_ = DL(self.data_, batch_size=batch_size_, collate_fn=self.collate_fn, **args_)
+            self.loader_ = DL(self.data_, batch_size=batch_size_, **args_)
         else:
             self.loader_ = None
 
@@ -344,12 +402,21 @@ class Trainer:
     #------------------------#
 
     def train(self):
+        
+        self.is_training = True
         self.make_dataloader()
+
+        # training stats
+        self.time_per_epoch = []
+        self.time_per_step = []
+        self.memory_utilization = []
+        self.grad_norm_per_step = []
+        self.learning_rate_per_step = []
 
         self.trigger_callbacks("epoch_start")
         self.statistics()
         self.trigger_callbacks("epoch_end")
-        
+
         while self.epoch < self.epochs:
             self.epoch += 1
 
@@ -360,6 +427,8 @@ class Trainer:
             self.trigger_callbacks("epoch_end")
             if self.update_schedule_every_epoch:
                 self.schedule.step()
+
+        self.is_training = False
 
         return
 
@@ -377,31 +446,84 @@ class Trainer:
             )
         else:
             batch_iterator = self._loader
+            
+        # start time
+        epoch_start_time = time.time()
 
         for batch in batch_iterator:
+
+            # reset peak memory stats
+            if self.is_cuda:
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+
+            # start time
+            batch_start_time = time.time()
+
+            # zero out gradients
             self.opt.zero_grad()
+
+            # trigger batch start callback
             self.trigger_callbacks("batch_start")
 
-            self.noise_schedule.step()
+            # self.noise_schedule.step()
 
             self.model.train()
-            loss = self.batch_loss(batch)
-            loss.backward()
 
+            with self.auto_cast:
+                if self.attn_backend is not None:
+                    with torch.nn.attention.sdpa_kernel(self.attn_backend):
+                        loss = self.batch_loss(batch)
+                else:
+                    loss = self.batch_loss(batch)
+
+            # append loss to list
             self.train_loss_per_batch.append(loss.item())
 
-            self.trigger_callbacks("batch_post_grad")
-            if self.clip_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            # backward pass with gradient scaling
+            self.grad_scaler.scale(loss).backward() # replaces loss.backward()
 
-            self.opt.step()
-            self.trigger_callbacks("batch_end")
-            self.opt.zero_grad()
+            # trigger post grad callback
+            self.trigger_callbacks("batch_post_grad")
+
+            # unscale gradients
+            self.grad_scaler.unscale_(self.opt)
             
-            # update schedule every batch
+            # clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm).item()
+            
+            # append grad norm and learning rate to list
+            self.grad_norm_per_step.append(grad_norm)
+            self.learning_rate_per_step.append(self.schedule.get_last_lr()[0])
+            
+            # print warning if grad norm is too large
+            if grad_norm > 1e3:
+                print(f"[WARNING] Exploding grad norm: {grad_norm:.2f}")
+                # maybe trigger early stop or dump checkpoint
+                # raise ValueError("Exploding grad norm")
+
+            # step optimizer with gradient scaling
+            self.grad_scaler.step(self.opt) # replace self.opt.step()
+
+            # update gradient scaler value
+            self.grad_scaler.update()
+
+            # update schedule after every batch
             if not self.update_schedule_every_epoch:
                 self.schedule.step()
 
+            # update time per step
+            self.time_per_step.append(time.time() - batch_start_time)
+
+            # update memory utilization per step
+            if self.is_cuda:
+                torch.cuda.synchronize()
+                self.memory_utilization.append(torch.cuda.max_memory_allocated() / 1024**3)
+
+            # trigger batch end callback
+            self.trigger_callbacks("batch_end")
+
+            # print batch info
             if print_batch:
                 batch_iterator.set_description(
                     f"[Epoch {self.epoch} / {self.epochs}] " +
@@ -409,30 +531,34 @@ class Trainer:
                     f"LOSS {loss.item():.8e}"
                 )
 
+        self.time_per_epoch.append(time.time() - epoch_start_time)
+
         return
     
-    def move_to_device(self, x):
-        return x.to(self.device) if isinstance(x, torch.Tensor) else x
+    def move_to_device(self, batch):
+        if isinstance(batch, tuple) or isinstance(batch, list):
+            batch = [self.move_to_device(x) for x in batch]
+        elif isinstance(batch, dict):
+            batch = {k: self.move_to_device(v) for k, v in batch.items()}
+        elif isinstance(batch, torch.Tensor):
+            batch = batch.to(self.device)
+        else:
+            batch = batch.to(self.device)
+        return batch
 
     def batch_loss(self, batch):
+        batch = self.move_to_device(batch)
+
+        # calculate loss
         if self.batch_lossfun is not None:
-            if isinstance(batch, tuple) or isinstance(batch, list):
-                batch = [self.move_to_device(x) for x in batch]
-            elif isinstance(batch, dict):
-                batch = {k: self.move_to_device(v) for k, v in batch.items()}
-            elif isinstance(batch, torch.Tensor):
-                batch = self.move_to_device(batch)
-            else:
-                batch = batch.to(self.device)
             loss = self.batch_lossfun(self, self.model, batch)
         elif self.gnn_loader:
             batch = batch.to(self.device)
             yh = self.model(batch)
             loss = self.lossfun(yh, batch.y)
         else:
-            x = batch[0].to(self.device)
-            y = batch[1].to(self.device)
-
+            # assume batch is a tuple of (x, y)
+            x, y = batch
             yh = self.model(x)
             loss = self.lossfun(yh, y)
 
@@ -443,20 +569,40 @@ class Trainer:
     #------------------------#
 
     def get_batch_size(self, batch, loader):
-        bs = batch.num_graphs if self.gnn_loader else batch[0].size(0)
+        try:
+            if self.gnn_loader:
+                bs = batch.num_graphs
+            elif isinstance(batch, tuple) or isinstance(batch, list):
+                bs = len(batch[0])
+            elif isinstance(batch, dict):
+                bs = len(batch[list(batch.keys())[0]])
+            else:
+                bs = batch.size(0)
+        except:
+            bs = loader.batch_size
         return min(bs, loader.batch_size)
 
     @torch.no_grad()
     def evaluate(self, loader):
         self.model.eval()
+        
+        if self.statsfun is not None:
+            return self.statsfun(self, loader)
+
+        print_batch = self.verbose and (self.GLOBAL_RANK == 0) and self.print_batch # and (len(self._loader) > 1)
+        if print_batch:
+            batch_iterator = tqdm(loader, desc="Evaluating (train/test) dataset", ncols=80)
+        else:
+            batch_iterator = loader
 
         N, L = 0, 0.0
-        for batch in loader:
+        for batch in batch_iterator:
             n = self.get_batch_size(batch, loader)
-            l = self.batch_loss(batch).item()
+            with self.auto_cast:
+                l = self.batch_loss(batch).item()
             N += n
             L += l * n
-            
+
         if self.DDP:
             L = torch.tensor(L, device=self.device)
             N = torch.tensor(N, device=self.device)
@@ -472,7 +618,7 @@ class Trainer:
         return loss, None
 
     def statistics(self):
-        
+
         _loss, _stats = self.evaluate(self._loader_)
 
         if self.loader_ is not None:
@@ -487,22 +633,19 @@ class Trainer:
                 msg += f"TRAIN LOSS: {_loss:.6e} | TEST LOSS: {loss_:.6e}"
             else:
                 msg += f"LOSS: {_loss:.6e}"
-            if _stats is not None:
-                if self.loader_ is not None:
-                    msg += f"TRAIN STATS: {_stats} | TEST STATS: {stats_}"
-                else:
-                    msg += f"STATS: {_stats}"
             print(msg)
 
         self.stat_vals = {
             "train_loss" : _loss,
-            "test_loss" : loss_,
             "train_stats" : _stats,
+            "test_loss" : loss_,
             "test_stats" : stats_,
         }
-        self.train_loss_fullbatch.append(_loss)
-        self.test_loss_fullbatch.append(loss_)
-        self.num_steps_fullbatch.append(len(self.train_loss_per_batch))
+
+        if self.is_training:
+            self.train_loss_fullbatch.append(_loss)
+            self.test_loss_fullbatch.append(loss_)
+            self.num_steps_fullbatch.append(len(self.train_loss_per_batch))
         
         return
 #======================================================================#

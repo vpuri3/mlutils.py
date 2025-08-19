@@ -37,9 +37,7 @@ class Callback:
     def load(self, trainer: mlutils.Trainer):
         ckpt_dirs = [dir for dir in os.listdir(self.case_dir) if dir.startswith('ckpt')]
         if len(ckpt_dirs) == 0:
-            if trainer.GLOBAL_RANK == 0:
-                print(f'No checkpoint found in {self.case_dir}. starting from scrach.')
-            return
+            raise ValueError(f'No checkpoint found in {self.case_dir}.')
         load_dir = sorted(ckpt_dirs)[-1]
         model_file = os.path.join(self.case_dir, load_dir, 'model.pt')
 
@@ -69,13 +67,31 @@ class Callback:
             os.makedirs(ckpt_dir, exist_ok=True)
             trainer.save(os.path.join(ckpt_dir, 'model.pt'))
 
+        # save model_stats.json
+        model_stats = dict(
+            num_params=sum(p.numel() for p in trainer.model.parameters()),
+            avg_time_per_step=torch.mean(torch.tensor(trainer.time_per_step)).item(),
+            avg_time_per_epoch=torch.mean(torch.tensor(trainer.time_per_epoch)).item(),
+            avg_memory_utilization=torch.mean(torch.tensor(trainer.memory_utilization)).item(),
+        )
+
+        if trainer.GLOBAL_RANK == 0:
+            print(f"Time per step: {model_stats['avg_time_per_step']:.4e}s\tTime per epoch: {model_stats['avg_time_per_epoch']:.4e}s\tMemory utilization: {model_stats['avg_memory_utilization']:.4e}GB")
+
+            with open(os.path.join(ckpt_dir, 'model_stats.json'), 'w') as f:
+                json.dump(model_stats, f, indent=4)
+            with open(os.path.join(self.case_dir, 'model_stats.json'), 'w') as f:
+                json.dump(model_stats, f, indent=4)
+
         # save stats
         if trainer.GLOBAL_RANK == 0:
             with open(os.path.join(ckpt_dir, 'stats.json'), 'w') as f:
-                json.dump(trainer.stat_vals, f)
+                json.dump(trainer.stat_vals, f, indent=4)
 
-        # save loss plot
+        # save plots
         if trainer.GLOBAL_RANK == 0:
+
+            # save loss plot
             plt.figure(figsize=(8, 4), dpi=175)
             train_loss_per_batch = trainer.train_loss_per_batch
             if isinstance(train_loss_per_batch, list):
@@ -97,16 +113,42 @@ class Callback:
             plt.savefig(os.path.join(self.case_dir, 'losses.png'))
             plt.close()
 
-        # modify dataset transform
-        if hasattr(self, 'modify_dataset_transform'):
-            self.modify_dataset_transform(trainer, True)
+            # save grad norm plot
+            plt.figure(figsize=(8, 4), dpi=175)
+            grad_norm = trainer.grad_norm_per_step
+            if isinstance(grad_norm, list):
+                grad_norm = torch.tensor(grad_norm)
+            grad_norm[grad_norm < 1e-12] = torch.nan
+            plt.plot(grad_norm, color='k', label='Grad norm', alpha=0.8)
+            plt.xlabel('Step')
+            plt.ylabel('Grad norm')
+            plt.yscale('log', base=10)
+            plt.title('Grad norm')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(ckpt_dir, 'grad_norm.png'))
+            plt.savefig(os.path.join(self.case_dir, 'grad_norm.png'))
+            plt.close()
+
+            # save learning rate plot
+            plt.figure(figsize=(8, 4), dpi=175)
+            lr = trainer.learning_rate_per_step
+            if isinstance(lr, list):
+                lr = torch.tensor(lr)
+            lr[lr < 1e-12] = torch.nan
+            plt.plot(lr, color='k', label='Learning rate', alpha=0.8)
+            plt.xlabel('Step')
+            plt.ylabel('Learning rate')
+            plt.yscale('log', base=10)
+            plt.title('Learning rate')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(ckpt_dir, 'learning_rate.png'))
+            plt.savefig(os.path.join(self.case_dir, 'learning_rate.png'))
+            plt.close()
 
         # evaluate model
         self.evaluate(trainer, ckpt_dir)
-
-        # revert dataset transform
-        if hasattr(self, 'modify_dataset_transform'):
-            self.modify_dataset_transform(trainer, False)
 
         # revert self.final
         self.final = False
