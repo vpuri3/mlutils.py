@@ -102,7 +102,7 @@ def main(cfg, device):
     # Trainer kwargs
     #----------#
 
-    if cfg.optimizer == 'adamw':
+    if cfg.optimizer in ['adamw', 'adam']:
         make_optimizer = project.make_optimizer_adamw
     elif cfg.optimizer == 'lion':
         make_optimizer = project.make_optimizer_lion
